@@ -26,8 +26,7 @@ import {
  * ==========================================================
  * CONFIGURAÇÃO DE PREÇO
  * ==========================================================
- * ⬅️ MUDE AQUI O VALOR
- * Valor em centavos (AMOUNT_CENTS):
+ * ⬅️ MUDE AQUI O VALOR (centavos)
  *   500 = R$ 5,00 (produção)
  *     1 = R$ 0,01 (teste)
  */
@@ -39,7 +38,7 @@ const {
 } = process.env;
 
 // ---------------------------
-// Discord Client
+// Discord Client + Diagnóstico
 // ---------------------------
 const client = new Client({
   intents: [
@@ -51,13 +50,13 @@ const client = new Client({
   partials: [Partials.Channel]
 });
 
-// logs úteis de diagnóstico
+// DEBUG detalhado do gateway (útil para ver conexão/ready)
+client.on('debug', (m) => console.log('[discord.js debug]', m));
+client.on('error', (e) => console.error('Discord client error:', e));
+client.on('shardError', (e) => console.error('WebSocket shard error:', e));
 client.on('ready', () => {
   console.log(`Bot online como ${client.user.tag}`);
 });
-client.on('error', (e) => console.error('Discord client error:', e));
-client.on('shardError', (e) => console.error('WebSocket shard error:', e));
-// client.on('debug', (m) => console.log('[discord.js debug]', m)); // opcional
 
 // ---------------------------
 // Slash commands
@@ -65,7 +64,7 @@ client.on('shardError', (e) => console.error('WebSocket shard error:', e));
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
-  // Comando de teste rápido
+  // Comando simples para testar conectividade
   if (interaction.commandName === 'ping') {
     try {
       await interaction.reply({ content: 'pong 🏓', ephemeral: true });
@@ -75,7 +74,7 @@ client.on('interactionCreate', async (interaction) => {
     return;
   }
 
-  // Fluxo principal
+  // Fluxo principal: /join
   if (interaction.commandName !== 'join') return;
 
   const nickname = interaction.options.getString('nickname', true);
@@ -173,9 +172,7 @@ Pague e aguarde a confirmação automática.`;
 }
 
 // ---------------------------
-//
-// Express + Webhook
-//
+// Express + Webhook (Mercado Pago)
 // ---------------------------
 const app = express();
 
@@ -192,7 +189,6 @@ app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
 
 app.get('/', (_req, res) => res.send('OK'));
 
-// Webhook do PSP (Mercado Pago)
 app.post('/webhook/psp', async (req, res) => {
   try {
     // Validação leve; no MP validamos consultando a API depois
@@ -262,7 +258,7 @@ app.listen(Number(PORT || 10000), () => {
 });
 
 // ---------------------------
-// Login com diagnóstico
+// Login com diagnóstico (NÃO REMOVA)
 // ---------------------------
 const TOKEN = (process.env.DISCORD_TOKEN || '').trim();
 
@@ -277,3 +273,10 @@ client.login(TOKEN).catch((e) => {
   console.error('Falha ao logar no Discord:', e);
   process.exit(1);
 });
+
+// Watchdog: alerta se não ficar READY em 30s
+setTimeout(() => {
+  if (!client.isReady?.()) {
+    console.warn('⚠️ Ainda não ficou READY após 30s — veja logs [discord.js debug] acima.');
+  }
+}, 30000);
