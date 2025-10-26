@@ -1,0 +1,14 @@
+[
+  {
+    "name": "join",
+    "description": "Participar do evento (gera PIX de R$5,00)",
+    "options": [
+      {
+        "type": 3,
+        "name": "nickname",
+        "description": "Seu nickname/ID para a liberação",
+        "required": true
+      }
+    ]
+  }
+]

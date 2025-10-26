@@ -33,15 +33,25 @@ client.on('interactionCreate', async (interaction) => {
   const nickname = interaction.options.getString('nickname', true);
   const discord_user_id = interaction.user.id;
 
+  // 👉 Responde imediatamente para não estourar o timeout do Discord
+  try {
+    await interaction.deferReply({ ephemeral: true });
+  } catch (e) {
+    console.error('Falha ao deferReply:', e);
+    return; // sem defer nem reply, não há o que fazer
+  }
+
   const reference_code = `EVT5-${Date.now().toString(36)}-${discord_user_id.slice(-4)}`;
 
   try {
+    // 1) Criar cobrança PIX no PSP (pode demorar alguns segundos)
     const { txid, pixCopiaECola } = await createPixCharge({
       reference_code,
       amount_cents: 500,
       description: `Ingresso evento - ${nickname}`
     });
 
+    // 2) Persistir pagamento
     createPayment({
       reference_code,
       discord_user_id,
@@ -50,8 +60,10 @@ client.on('interactionCreate', async (interaction) => {
       created_at: new Date().toISOString()
     });
 
+    // 3) Gerar QR
     const qrDataUrl = await QRCode.toDataURL(pixCopiaECola);
 
+    // 4) Tentar DM
     try {
       const dm = await interaction.user.createDM();
       await dm.send({
@@ -61,24 +73,20 @@ client.on('interactionCreate', async (interaction) => {
 Pague e aguarde a confirmação automática (você será notificado aqui).`,
         files: [{ attachment: qrDataUrl, name: `pix_${reference_code}.png` }]
       });
-      await dm.send({
-        content: `**Copia e Cola PIX:**\n\`\`\`${pixCopiaECola}\`\`\``
-      });
+      await dm.send({ content: `**Copia e Cola PIX:**\n\`\`\`${pixCopiaECola}\`\`\`` });
 
-      await interaction.reply({ ephemeral: true, content: 'Enviei o PIX por DM. Se não recebeu, habilite DMs e use o comando novamente.' });
+      await interaction.editReply('✅ Enviei o PIX por DM. Se não recebeu, habilite DMs e use o comando novamente.');
     } catch {
-      await interaction.reply({
-        ephemeral: true,
-        content: 'Não consegui enviar DM (provavelmente bloqueada). Habilite DMs comigo e use o comando novamente.'
-      });
+      await interaction.editReply('⚠️ Não consegui enviar DM (provavelmente bloqueada). Habilite DMs comigo e use o comando novamente.');
     }
 
   } catch (err) {
-    console.error(err);
-    await interaction.reply({ ephemeral: true, content: 'Falha ao gerar cobrança. Tente novamente.' });
+    console.error('Erro no /join:', err);
+    try {
+      await interaction.editReply('❌ Falha ao gerar cobrança. Tente novamente.');
+    } catch {}
   }
 });
-
 // ---- Express + Webhook
 const app = express();
 
