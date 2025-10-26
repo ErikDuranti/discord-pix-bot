@@ -1,10 +1,39 @@
+// src/index.js
 import 'dotenv/config';
 import express from 'express';
 import rawBody from 'raw-body';
 import QRCode from 'qrcode';
-import { Client, GatewayIntentBits, Partials, PermissionFlagsBits } from 'discord.js';
-import { createPayment, getPaymentByReference, markPaid } from './db.js';
-import { createPixCharge, validateWebhookSignature, parseWebhookEvent } from './psp.js';
+import {
+  Client,
+  GatewayIntentBits,
+  Partials,
+  PermissionFlagsBits
+} from 'discord.js';
+
+import {
+  createPayment,
+  getPaymentByReference,
+  markPaid
+} from './db.js';
+
+import {
+  createPixCharge,
+  validateWebhookSignature,
+  parseWebhookEvent,
+  parseWebhookPaymentData
+} from './psp.js';
+
+/**
+ * ==========================================================
+ * CONFIGURAÇÃO DE PREÇO
+ * ==========================================================
+ * ⬅️ MUDE AQUI O VALOR
+ * Valor em centavos (AMOUNT_CENTS):
+ *   500 = R$ 5,00 (produção)
+ *     1 = R$ 0,01 (teste)
+ */
+const AMOUNT_CENTS = 1; // ⬅️ MUDE AQUI O VALOR
+const PRICE_BR = (AMOUNT_CENTS / 100).toFixed(2);
 
 const {
   DISCORD_TOKEN, GUILD_ID, ROLE_ID, PORT, WEBHOOK_SECRET
@@ -25,7 +54,9 @@ client.once('ready', () => {
   console.log(`Bot online como ${client.user.tag}`);
 });
 
-// ---- Slash command handler
+// ==========================
+// Handler do /join
+// ==========================
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   if (interaction.commandName !== 'join') return;
@@ -33,65 +64,104 @@ client.on('interactionCreate', async (interaction) => {
   const nickname = interaction.options.getString('nickname', true);
   const discord_user_id = interaction.user.id;
 
-  // 👉 Responde imediatamente para não estourar o timeout do Discord
-  try {
-    await interaction.deferReply({ ephemeral: true });
-  } catch (e) {
-    console.error('Falha ao deferReply:', e);
-    return; // sem defer nem reply, não há o que fazer
-  }
+  // 1) ACK instantâneo para não estourar timeout de 3s
+  await interaction.reply({
+    content: `🔄 Recebi seu pedido! Vou gerar seu PIX (R$ ${PRICE_BR}) e te enviar por DM em instantes.`,
+    ephemeral: true
+  });
 
+  // 2) Processa em background
+  processJoin(interaction, { nickname, discord_user_id }).catch(async (err) => {
+    console.error('processJoin error:', err);
+    try {
+      await interaction.followUp({
+        content: '❌ Ocorreu um erro ao gerar sua cobrança. Tente novamente.',
+        ephemeral: true
+      });
+    } catch {}
+  });
+});
+
+async function processJoin(interaction, { nickname, discord_user_id }) {
   const reference_code = `EVT5-${Date.now().toString(36)}-${discord_user_id.slice(-4)}`;
 
+  // 3) Cria a cobrança PIX (Mercado Pago) — pode levar alguns segundos
+  const { txid, pixCopiaECola } = await createPixCharge({
+    reference_code,
+    amount_cents: AMOUNT_CENTS, // usa a constante configurável
+    description: `Ingresso evento - ${nickname}`
+  });
+
+  // 4) Persiste pagamento como pending
+  createPayment({
+    reference_code,
+    discord_user_id,
+    nickname,
+    amount_cents: AMOUNT_CENTS,
+    created_at: new Date().toISOString()
+  });
+
+  // 5) Gera QR (não bloqueante — mas pode levar ~300–600ms)
+  let qrDataUrl = null;
   try {
-    // 1) Criar cobrança PIX no PSP (pode demorar alguns segundos)
-    const { txid, pixCopiaECola } = await createPixCharge({
-      reference_code,
-      amount_cents: 500,
-      description: `Ingresso evento - ${nickname}`
-    });
-
-    // 2) Persistir pagamento
-    createPayment({
-      reference_code,
-      discord_user_id,
-      nickname,
-      amount_cents: 500,
-      created_at: new Date().toISOString()
-    });
-
-    // 3) Gerar QR
-    const qrDataUrl = await QRCode.toDataURL(pixCopiaECola);
-
-    // 4) Tentar DM
-    try {
-      const dm = await interaction.user.createDM();
-      await dm.send({
-        content:
-`Olá, **${nickname}**! Aqui está seu PIX (R$ 5,00).
-**Referência:** \`${reference_code}\`
-Pague e aguarde a confirmação automática (você será notificado aqui).`,
-        files: [{ attachment: qrDataUrl, name: `pix_${reference_code}.png` }]
-      });
-      await dm.send({ content: `**Copia e Cola PIX:**\n\`\`\`${pixCopiaECola}\`\`\`` });
-
-      await interaction.editReply('✅ Enviei o PIX por DM. Se não recebeu, habilite DMs e use o comando novamente.');
-    } catch {
-      await interaction.editReply('⚠️ Não consegui enviar DM (provavelmente bloqueada). Habilite DMs comigo e use o comando novamente.');
-    }
-
-  } catch (err) {
-    console.error('Erro no /join:', err);
-    try {
-      await interaction.editReply('❌ Falha ao gerar cobrança. Tente novamente.');
-    } catch {}
+    qrDataUrl = await QRCode.toDataURL(pixCopiaECola);
+  } catch (e) {
+    console.warn('Falha ao gerar QR, vamos enviar só o copia-e-cola:', e);
   }
-});
-// ---- Express + Webhook
+
+  // 6) Tenta DM
+  let dmSent = false;
+  try {
+    const dm = await interaction.user.createDM();
+    const header =
+`Olá, **${nickname}**! Aqui está seu PIX (R$ ${PRICE_BR}).
+**Referência:** \`${reference_code}\`
+Pague e aguarde a confirmação automática.`;
+
+    await dm.send({ content: header });
+    if (qrDataUrl) {
+      await dm.send({ files: [{ attachment: qrDataUrl, name: `pix_${reference_code}.png` }] });
+    }
+    await dm.send({ content: `**Copia e Cola PIX:**\n\`\`\`${pixCopiaECola}\`\`\`` });
+    dmSent = true;
+  } catch (e) {
+    console.warn('DM bloqueada ou falhou:', e);
+  }
+
+  // 7) Feedback no canal (ephemeral)
+  if (dmSent) {
+    await interaction.followUp({
+      content: '✅ Te enviei a cobrança por DM. Se não aparecer, verifica as DMs comigo.',
+      ephemeral: true
+    });
+  } else {
+    // fallback: envia tudo no canal (ephemeral)
+    const parts = [
+      `⚠️ Não consegui enviar por DM (provavelmente bloqueada). Segue aqui mesmo:`,
+      `**Referência:** \`${reference_code}\``,
+      `**Copia e Cola PIX (R$ ${PRICE_BR}):**\n\`\`\`${pixCopiaECola}\`\`\``
+    ];
+    await interaction.followUp({
+      content: parts.join('\n\n'),
+      ephemeral: true
+    });
+    if (qrDataUrl) {
+      await interaction.followUp({
+        content: 'QR Code:',
+        files: [{ attachment: qrDataUrl, name: `pix_${reference_code}.png` }],
+        ephemeral: true
+      });
+    }
+  }
+}
+
+// ==========================
+// Express + Webhook
+// ==========================
 const app = express();
 
-// Capturar corpo cru para HMAC
-app.use(async (req, res, next) => {
+// capturar corpo cru (alguns PSPs usam HMAC do raw body)
+app.use(async (req, _res, next) => {
   try {
     req.rawBody = await rawBody(req);
   } catch {
@@ -103,27 +173,43 @@ app.use(express.json({ verify: (req, _res, buf) => { req.rawBody = buf; } }));
 
 app.get('/', (_req, res) => res.send('OK'));
 
-// Webhook do PSP
+// Webhook Mercado Pago
 app.post('/webhook/psp', async (req, res) => {
   try {
-    // Se quiser relaxar no mock, pode pular esta validação.
+    // Validação leve — no MP vamos conferir na API oficial depois
     const valid = validateWebhookSignature(req, WEBHOOK_SECRET);
-    if (!valid && process.env.PSP_PROVIDER !== 'mock') {
-      console.warn('Webhook assinatura inválida');
-      return res.status(400).send('invalid signature');
+    if (!valid) {
+      console.warn('Webhook com assinatura inválida (ignorado)');
+      // seguimos mesmo assim, pois vamos validar consultando o pagamento
     }
 
-    const event = parseWebhookEvent(req.body); 
-    const { reference_code, status, amount_cents, provider_txid } = await parseWebhookPaymentData(event);
+    // 1) Parse do webhook "cru" (pega o ID da notificação/pagamento)
+    const event = parseWebhookEvent(req.body);
 
+    // 2) Busca os dados do pagamento no MP e normaliza
+    const { reference_code, status, amount_cents, provider_txid } =
+      await parseWebhookPaymentData(event);
+
+    if (!reference_code) {
+      console.warn('Webhook sem reference_code — ignorando.');
+      return res.status(200).send('ok');
+    }
+
+    // 3) Localiza pagamento
     const payment = getPaymentByReference(reference_code);
-    if (!payment) return res.status(200).send('ok');
+    if (!payment) {
+      console.warn('Pagamento não encontrado p/ referência', reference_code);
+      return res.status(200).send('ok');
+    }
 
+    // idempotência
     if (payment.status === 'paid') return res.status(200).send('ok');
 
-    if (status === 'CONFIRMED' && Number(amount_cents) === 500) {
+    // 4) Validação de valor + status
+    if (status === 'CONFIRMED' && Number(amount_cents) === Number(AMOUNT_CENTS)) {
       markPaid(reference_code, provider_txid);
 
+      // 5) Atribuir cargo no Discord
       try {
         const guild = await client.guilds.fetch(GUILD_ID);
         const member = await guild.members.fetch(payment.discord_user_id);
@@ -145,26 +231,17 @@ app.post('/webhook/psp', async (req, res) => {
       return res.status(200).send('ok');
     }
 
-    return res.status(200).send('ignored');
+    // valor divergente ou status não confirmado
+    console.warn('Pagamento ignorado por status/valor:', { status, amount_cents });
+    return res.status(200).send('ok');
   } catch (e) {
     console.error('Erro webhook:', e);
     return res.status(200).send('ok');
   }
 });
 
-// Endpoint MOCK para confirmar pagamento manualmente (apenas DEV)
-app.post('/admin/mock/confirm', (req, res) => {
-  if (process.env.PSP_PROVIDER !== 'mock') return res.status(403).send('forbidden');
-  const { ref, txid = 'MOCK-TX', amount_cents = 500 } = req.body || {};
-  // Simula o POST do PSP
-  // Você pode bater com: curl -X POST .../admin/mock/confirm -H "Content-Type: application/json" -d '{"ref":"EVT5-..."}'
-  req.body = { ref, txid, amount_cents, status: 'CONFIRMED' };
-  // Reencaminha para o webhook oficial
-  return app._router.handle({ ...req, url: '/webhook/psp' }, res, () => {});
-});
-
 app.listen(Number(PORT || 10000), () => {
-  console.log(`HTTP ouvindo em :${PORT}`);
+  console.log(`HTTP ouvindo em :${PORT || 10000}`);
 });
 
 if (!DISCORD_TOKEN) {
