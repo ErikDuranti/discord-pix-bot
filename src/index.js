@@ -105,8 +105,8 @@ app.post('/webhook/psp', async (req, res) => {
       return res.status(400).send('invalid signature');
     }
 
-    const event = parseWebhookEvent(req.body);
-    const { reference_code, status, amount_cents, provider_txid } = event;
+    const event = parseWebhookEvent(req.body); 
+    const { reference_code, status, amount_cents, provider_txid } = await parseWebhookPaymentData(event);
 
     const payment = getPaymentByReference(reference_code);
     if (!payment) return res.status(200).send('ok');

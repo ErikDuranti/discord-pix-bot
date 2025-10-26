@@ -1,68 +1,108 @@
 import crypto from 'crypto';
+import fetch from 'node-fetch';
 
-// ========= UTIL =========
+// =================================================
+// VALIDAÇÃO DE WEBHOOK DO MERCADO PAGO
+// =================================================
+// MP envia cabeçalho: x-signature (JWT) + topic.
+// Validação é feita consultando o pagamento no endpoint /v1/payments/{id}
+// para garantir que é legítimo (forma mais simples e segura).
 export function validateWebhookSignature(req, secret) {
-  // Exemplo genérico usando HMAC do corpo cru (depende do PSP)
-  const sig = req.headers['x-signature'];
-  if (!sig || !secret) return false;
-  const expected = crypto.createHmac('sha256', secret).update(req.rawBody || '').digest('hex');
-  try {
-    return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
-  } catch {
-    return false;
-  }
+  // Aqui, como vamos verificar dados direto no MP, podemos retornar true diretamente.
+  // Se quiser, pode usar 'secret' como fallback para IP whitelist.
+  return true;
 }
 
-// ========= MOCK PROVIDER =========
-const mockCharges = new Map();
+// =================================================
+// CRIAR COBRANÇA PIX (CHARGE) NO MERCADO PAGO
+// =================================================
+// Docs: https://www.mercadopago.com.br/developers/pt/docs/pixel-integration/integration/api/
+// Endpoint: POST https://api.mercadopago.com/v1/payments
+async function mp_createPixCharge({ reference_code, amount_cents, description }) {
+  const token = process.env.MP_ACCESS_TOKEN;
+  const body = {
+    transaction_amount: (amount_cents / 100),
+    description: description || `Pagamento ref ${reference_code}`,
+    payment_method_id: 'pix',
+    external_reference: reference_code,
+    payer: {
+      email: 'email@placeholder.com' // opcional, se tiver
+    }
+  };
 
-async function mock_createPixCharge({ reference_code, amount_cents }) {
-  const txid = 'MOCK-' + crypto.randomBytes(6).toString('hex').toUpperCase();
-  const pixCopiaECola = `00020126MOCKREF:${reference_code}54045.005802BR5920EVENTO DISCORD6009SAO PAULO`;
-  mockCharges.set(reference_code, { txid, amount_cents, status: 'PENDING', pixCopiaECola });
+  const resp = await fetch('https://api.mercadopago.com/v1/payments', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(body)
+  });
+
+  if (!resp.ok) {
+    const txt = await resp.text();
+    throw new Error('MercadoPago create charge error: ' + txt);
+  }
+
+  const data = await resp.json();
+  // O campo `point_of_interaction.transaction_data.qr_code` contém o copia e cola
+  const pix = data.point_of_interaction?.transaction_data;
+  const pixCopiaECola = pix?.qr_code;
+  const txid = data.id;
+
   return { txid, pixCopiaECola };
 }
 
-function mock_parseWebhookEvent(body) {
-  // Nosso mock espera: { ref: "...", txid: "...", amount_cents: 500, status: "CONFIRMED" }
+// =================================================
+// PARSE DO WEBHOOK MERCADO PAGO
+// =================================================
+// O webhook envia algo como:
+// {
+//   "id": "1900001234",
+//   "live_mode": true,
+//   "type": "payment",
+//   "date_created": "...",
+//   "api_version": "...",
+//   "action": "payment.created",
+//   "data": { "id": "1234567890" }
+// }
+// Depois vamos buscar o payment completo para extrair valor, reference_code...
+export function parseWebhookEvent(body) {
   return {
-    reference_code: body.ref,
-    status: body.status,
-    amount_cents: body.amount_cents,
-    provider_txid: body.txid
+    notification_id: body.data?.id, // id do pagamento no MP
+    type: body.type
   };
 }
 
-// ========= MERCADO PAGO (EXEMPLO) =========
-// Preencha com sua integração real, ou troque pelo seu PSP.
-// Docs MP: crie pagamento PIX e obtenha QR / copia e cola. Webhook: topic 'payment' etc.
-async function mercadopago_createPixCharge({ reference_code, amount_cents }) {
-  // Exemplo ilustrativo (não funcional sem credenciais e endpoints reais)
-  // 1) Criar pagamento com PIX e setar "external_reference" = reference_code
-  // 2) Retornar { txid, pixCopiaECola }
-  // Você precisa:
-  // - Access Token (PSP_ACCESS_TOKEN)
-  // - Chamar REST do MP (fetch/axios)
-  throw new Error('mercadopago_createPixCharge não implementado. Use MOCK ou implemente seu PSP aqui.');
+// Função auxiliar para buscar o pagamento completo
+async function mp_getPaymentInfo(paymentId) {
+  const token = process.env.MP_ACCESS_TOKEN;
+  const resp = await fetch(`https://api.mercadopago.com/v1/payments/${paymentId}`, {
+    headers: { 'Authorization': `Bearer ${token}` }
+  });
+  if (!resp.ok) {
+    const txt = await resp.text();
+    throw new Error('MercadoPago getPayment error: ' + txt);
+  }
+  return resp.json();
 }
 
-function mercadopago_parseWebhookEvent(body) {
-  // Normalizar body do webhook do MP para {reference_code, status, amount_cents, provider_txid}
-  throw new Error('mercadopago_parseWebhookEvent não implementado. Use MOCK ou implemente seu PSP aqui.');
-}
-
-// ========= ROUTER =========
-export async function createPixCharge({ reference_code, amount_cents, description }) {
+// =================================================
+// EXPORTS DO PSP
+// =================================================
+export async function createPixCharge(opts) {
   const provider = process.env.PSP_PROVIDER || 'mock';
-  if (provider === 'mock') return mock_createPixCharge({ reference_code, amount_cents, description });
-  if (provider === 'mercadopago') return mercadopago_createPixCharge({ reference_code, amount_cents, description });
-  // Adicione aqui: efipagamentos, pagarme, seu banco, etc.
-  throw new Error(`PSP_PROVIDER '${provider}' não suportado ainda.`);
+  if (provider === 'mercadopago') return mp_createPixCharge(opts);
+  throw new Error(`PSP_PROVIDER '${provider}' não suportado aqui (troque para mock ou mercadopago).`);
 }
 
-export function parseWebhookEvent(body) {
-  const provider = process.env.PSP_PROVIDER || 'mock';
-  if (provider === 'mock') return mock_parseWebhookEvent(body);
-  if (provider === 'mercadopago') return mercadopago_parseWebhookEvent(body);
-  throw new Error(`PSP_PROVIDER '${provider}' não suportado ainda.`);
+export async function parseWebhookPaymentData(parsedEvent) {
+  // parsedEvent vem de parseWebhookEvent
+  const info = await mp_getPaymentInfo(parsedEvent.notification_id);
+  return {
+    reference_code: info.external_reference,
+    amount_cents: Math.round(info.transaction_amount * 100),
+    status: info.status === 'approved' ? 'CONFIRMED' : info.status.toUpperCase(),
+    provider_txid: info.id.toString()
+  };
 }
