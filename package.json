@@ -15,6 +15,7 @@
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "qrcode": "^1.5.3",
-    "raw-body": "^2.5.2"
+    "raw-body": "^2.5.2",
+    "node-fetch": "^3.3.2"
   }
 }
